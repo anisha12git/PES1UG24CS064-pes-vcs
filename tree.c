@@ -10,12 +10,14 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
@@ -114,24 +116,82 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// ─── TODO: Implemented ──────────────────────────────────────────────────
 
-// Build a tree hierarchy from the current index and write all tree
-// objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
+static int build_tree(const char *base_path, Tree *tree, ObjectID *id_out) {
+    DIR *dir = opendir(base_path);
+    if (!dir) return -1;
+
+    struct dirent *entry;
+    tree->count = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        if (strcmp(entry->d_name, ".pes") == 0)
+            continue;
+
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_path, entry->d_name);
+
+        uint32_t mode = get_file_mode(full_path);
+
+        TreeEntry *te = &tree->entries[tree->count];
+
+        strncpy(te->name, entry->d_name, sizeof(te->name) - 1);
+        te->mode = mode;
+
+        if (mode == MODE_DIR) {
+            Tree subtree;
+            if (build_tree(full_path, &subtree, &te->hash) != 0) {
+                closedir(dir);
+                return -1;
+            }
+        } else {
+            FILE *f = fopen(full_path, "rb");
+            if (!f) {
+                closedir(dir);
+                return -1;
+            }
+
+            fseek(f, 0, SEEK_END);
+            size_t size = ftell(f);
+            rewind(f);
+
+            void *buffer = malloc(size);
+            fread(buffer, 1, size, f);
+            fclose(f);
+
+            if (object_write(OBJ_BLOB, buffer, size, &te->hash) != 0) {
+                free(buffer);
+                closedir(dir);
+                return -1;
+            }
+
+            free(buffer);
+        }
+
+        tree->count++;
+    }
+
+    closedir(dir);
+
+    void *data;
+    size_t len;
+
+    if (tree_serialize(tree, &data, &len) != 0)
+        return -1;
+
+    if (object_write(OBJ_TREE, data, len, id_out) != 0) {
+        free(data);
+        return -1;
+    }
+
+    free(data);
+    return 0;
+}
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Tree root;
+    return build_tree(".", &root, id_out);
 }
